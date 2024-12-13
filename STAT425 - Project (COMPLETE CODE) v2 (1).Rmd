@@ -1,0 +1,2507 @@
+---
+title: "STAT 425 Final Code"
+author: "Andrew Sun, Aditya Daga, Brandon Fantine"
+output: pdf_document
+date: "2024-12-13"
+---
+
+```{r setup, include=FALSE}
+
+# Load necessary libraries
+library(dplyr)
+library(rjags)
+library(knitr)
+library(readr)
+library(stringr)
+
+# Set a seed for reproducibility
+set.seed(123)
+
+```
+
+# Question 1 - Andrew Sun
+
+Background:
+Tampa Bay Rays have been attempting to build a new baseball stadium, (for various reasons). I want to investigate whether or not stadium factors are so significant that the Rays should intentionally design their stadium in such a way to benefit their own players. To do this, we'll select the 4 players on their team with above 350 at-bats (Yandy Diaz, Brandon Lowe, Josh Lowe, and Jose Caballero), and investigate whether the combination of these four players historically play significantly better in some stadium designs than others. 
+
+```{r cars}
+file_path <- "/Users/andrewsun/Downloads/Clems Statistics - Sheet1.csv"
+
+
+clems_data <- read.csv(file_path, header = TRUE, stringsAsFactors = FALSE)
+head(clems_data)
+```
+
+```{r}
+clems_data$Stadium..see.notes. <- gsub("\\*", "", clems_data$Stadium..see.notes.)
+clems_data$Stadium..see.notes. <- trimws(clems_data$Stadium..see.notes.)
+clems_data$Stadium..see.notes.
+```
+
+```{r}
+colnames(clems_data)
+head(clems_data, 10)
+```
+
+```{r}
+# Remove rows where the Stadium column is empty
+clems_data <- clems_data[clems_data$Stadium..see.notes. != "", ]
+
+# Reset row indices
+row.names(clems_data) <- NULL
+```
+
+```{r}
+# Rename columns
+colnames(clems_data) <- c(
+  "Stadium", "Teams", "MLBLifetimeYears", "SeatingCapacity", "SeatingRowsTypical",
+  "Deck2", "UpperDeck", "LowerDeckShade", "UpperDeckShade", "FairTerritory",
+  "FoulTerritory", "FenceHeightLF", "FenceHeightCF", "FenceHeightRF",
+  "CFOOrientation", "Backstop", "LeftField", "LeftCenter", "CenterField",
+  "RightCenter", "RightField"
+)
+```
+
+```{r}
+# Convert relevant columns to numeric
+numeric_columns <- c(
+  "FenceHeightLF", "FenceHeightCF", "FenceHeightRF", "LeftField",
+  "LeftCenter", "CenterField", "RightCenter", "RightField"
+)
+
+clems_data[numeric_columns] <- lapply(clems_data[numeric_columns], function(x) as.numeric(as.character(x)))
+
+# Check for conversion issues
+summary(clems_data)
+```
+
+```{r}
+# Replace NAs with the mean (or median) for numeric columns
+for (col in numeric_columns) {
+  clems_data[[col]][is.na(clems_data[[col]])] <- mean(clems_data[[col]], na.rm = TRUE)
+}
+```
+
+```{r}
+# Check the cleaned data
+str(clems_data)
+
+# Preview the data
+head(clems_data)
+```
+
+```{r}
+clems_data$Stadium
+```
+
+
+```{r}
+library(baseballr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+
+```
+
+```{r}
+# Get player IDs
+yandy_id <- 650490
+brandon_id <- 666139
+jose_id <- 676609
+
+# Combine into a vector
+player_ids <- c(yandy_id, brandon_id, jose_id)
+names(player_ids) <- c("Yandy Diaz", "Brandon Lowe", "Jose Caballero")
+
+```
+
+```{r}
+# Retrieve the active roster for the Tampa Bay Rays (team ID: 139)
+rays_roster <- mlb_rosters(team_id = 139, roster_type = "active")
+
+print(rays_roster)
+
+```
+
+```{r}
+# Define the date range
+start_date <- "2024-04-01"
+end_date <- "2024-10-05"
+# Function to get pitch-by-pitch data for a player
+get_player_statcast_data <- function(player_id, start_date, end_date) {
+  # Retrieve data
+  statcast_data <- statcast_search(start_date = start_date, end_date = end_date, playerid = player_id, player_type = "batter")
+  return(statcast_data)
+}
+
+# Get statcast data for each player
+player_statcast_list <- lapply(player_ids, get_player_statcast_data, start_date = start_date, end_date = end_date)
+names(player_statcast_list) <- names(player_ids)
+
+```
+
+```{r}
+player_statcast_list$`Yandy Diaz`$home_team
+```
+
+```{r}
+# Function to process statcast data and calculate game-level OPS
+process_statcast_data <- function(statcast_data) {
+  # Filter out irrelevant events
+  statcast_data <- statcast_data %>%
+    filter(!is.na(events))
+
+  # Create variables for hits, at-bats, etc.
+  statcast_data <- statcast_data %>%
+    mutate(
+      single = ifelse(events == "single", 1, 0),
+      double = ifelse(events == "double", 1, 0),
+      triple = ifelse(events == "triple", 1, 0),
+      home_run = ifelse(events == "home_run", 1, 0),
+      BB = ifelse(events %in% c("walk", "hit_by_pitch", "intent_walk"), 1, 0),
+      HBP = ifelse(events == "hit_by_pitch", 1, 0),
+      SF = ifelse(events == "sac_fly", 1, 0),
+      AB = ifelse(events %in% c("single", "double", "triple", "home_run", "strikeout", "field_out", "grounded_into_double_play", "force_out", "fielders_choice_out", "field_error", "double_play", "triple_play"), 1, 0),
+      H = single + double + triple + home_run,
+      TB = single + 2 * double + 3 * triple + 4 * home_run
+    )
+
+  # Aggregate to game level
+  game_data <- statcast_data %>%
+    group_by(game_date, game_pk, player_name = paste(player_name), home_team, away_team) %>%
+    summarise(
+      AB = sum(AB),
+      H = sum(H),
+      BB = sum(BB),
+      HBP = sum(HBP),
+      SF = sum(SF),
+      TB = sum(TB),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      OBP = ifelse((AB + BB + HBP + SF) > 0, (H + BB + HBP) / (AB + BB + HBP + SF), NA),
+      SLG = ifelse(AB > 0, TB / AB, NA),
+      OPS = OBP + SLG
+    )
+  return(game_data)
+}
+
+# Process each player's statcast data
+player_game_logs_processed <- lapply(player_statcast_list, process_statcast_data)
+
+```
+
+```{r}
+# Combine data for all players
+combined_player_logs <- bind_rows(player_game_logs_processed)
+
+```
+
+```{r}
+# Create a data frame with team abbreviations and stadium names
+team_stadium_mapping <- data.frame(
+  home_team = c("ARI", "ATL", "BAL", "BOS", "CHC", "CIN", "CLE", "COL", "CWS", "DET",
+                "HOU", "KC", "LAA", "LAD", "MIA", "MIL", "MIN", "NYM", "NYY", "OAK",
+                "PHI", "PIT", "SD", "SEA", "SF", "STL", "TB", "TEX", "TOR", "WSH"),
+  stadium_name = c("Chase Field", "Truist (ex-SunTrust) Park", "Oriole Park at Camden Yards", "Fenway Park",
+                   "Wrigley Field", "Great American Ballpark", "Progressive Field", "Coors Field",
+                   "Guaranteed Rate Field", "Comerica Park", "Minute Maid Park", "Kauffman Stadium",
+                   "Angel Stadium", "Dodger Stadium", "Marlins Park", "Miller Park",
+                   "Target Field", "Citi Field", "Yankee Stadium", "Oakland Coliseum",
+                   "Citizens Bank Park", "PNC Park", "Petco Park", "Safeco Park",
+                   "Oracle Park", "Busch Stadium III", "Tropicana Field", "Globe Life Field",
+                   "Rogers Centre", "Nationals Park")
+)
+
+# View the mapping
+print(team_stadium_mapping)
+
+```
+```{r}
+# Merge the team-stadium mapping with combined player logs
+combined_player_logs <- combined_player_logs %>%
+  left_join(team_stadium_mapping, by = "home_team")
+
+```
+
+```{r}
+# Ensure stadium names are consistent
+combined_player_logs <- combined_player_logs %>%
+  mutate(stadium_name = as.character(stadium_name))
+
+clems_data <- clems_data %>%
+  mutate(stadium_name = as.character(Stadium))  # Adjust the column name as per your dataset
+
+# Merge with Clems dataset
+final_player_data <- combined_player_logs %>%
+  left_join(clems_data, by = "stadium_name")
+
+```
+
+```{r}
+final_player_data 
+# need to include player historical OPS as well
+# also need to get league avg OPS to compare
+```
+```{r}
+# Example using season OPS
+final_player_data <- final_player_data %>%
+  group_by(player_name) %>%
+  mutate(
+    average_OPS = mean(OPS, na.rm = TRUE),
+    OPS_diff = OPS - average_OPS
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+final_player_data
+```
+```{r}
+library(ggplot2)
+ggplot(final_player_data, aes(x = OPS_diff)) +
+  geom_histogram(binwidth = 0.1, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of OPS_diff", x = "OPS_diff", y = "Frequency") +
+  theme_minimal()
+
+```
+
+```{r}
+# Clean and convert to numeric
+final_player_data <- final_player_data %>%
+  mutate(SeatingCapacity = as.numeric(gsub("[^0-9]", "", SeatingCapacity)))
+
+# View the cleaned column
+head(final_player_data)
+
+
+```
+```{r}
+# Clean and convert to numeric
+final_player_data <- final_player_data %>%
+  mutate(MLBLifetimeYears = as.numeric(gsub("[^0-9]", "", MLBLifetimeYears)))
+
+# View the cleaned column
+head(final_player_data$MLBLifetimeYears)
+
+```
+
+```{r}
+# Specify the columns to clean
+columns_to_clean <- c(
+  "SeatingCapacity", "SeatingRowsTypical",
+  "Deck2", "UpperDeck", "LowerDeckShade", "UpperDeckShade", "FairTerritory",
+  "FoulTerritory", "FenceHeightLF", "FenceHeightCF", "FenceHeightRF", "Backstop", "LeftField", "LeftCenter", "CenterField",
+  "RightCenter", "RightField"
+)
+
+
+# Clean and convert these specific columns to numeric
+final_player_data <- final_player_data %>%
+  mutate(across(
+    all_of(columns_to_clean),
+    ~ as.numeric(gsub("[^0-9.-]", "", .))
+  ))
+
+# View the cleaned data
+
+
+final_player_data$CFOOrientation <- NULL
+
+head(final_player_data)
+
+```
+
+```{r}
+```
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+
+
+# List of predictor variables
+predictor_vars <- c(
+  "SeatingCapacity", "SeatingRowsTypical",
+  "Deck2", "UpperDeck", "LowerDeckShade", "UpperDeckShade", "FairTerritory",
+  "FoulTerritory", "FenceHeightLF", "FenceHeightCF", "FenceHeightRF", "Backstop", "LeftField", "LeftCenter", "CenterField",
+  "RightCenter", "RightField"
+)
+
+# Ensure that all predictor variables and OPS_diff are numeric
+final_player_data <- final_player_data %>%
+  mutate(across(all_of(c("OPS_diff", predictor_vars)), as.numeric))
+
+# Check for missing values
+summary(final_player_data)
+
+# Remove rows with missing values
+final_player_data <- final_player_data %>%
+  filter(complete.cases(.[, c("OPS_diff", predictor_vars)]))
+
+# Standardize predictor variables
+final_player_data <- final_player_data %>%
+  mutate(across(all_of(predictor_vars), ~ (.-mean(.))/sd(.)))
+
+# Preview the prepared data
+head(final_player_data)
+
+```
+
+```{r}
+colnames(final_player_data)
+```
+
+```{r}
+# Prepare data list for JAGS
+jags_data <- list(
+  N = nrow(final_player_data),
+  OPS_diff = final_player_data$OPS_diff,
+  X = as.matrix(final_player_data[, predictor_vars]),
+  P = length(predictor_vars)
+)
+
+library(rjags)
+
+model_code <- "
+model {
+  for (i in 1:N) {
+    # Likelihood
+    OPS_diff[i] ~ dt(mu[i], tau, nu)
+    mu[i] <- beta0 + inprod(beta[1:P], X[i,])
+  }
+
+  # Priors for coefficients
+  beta0 ~ dnorm(0, 0.01)  # Precision is 1/variance
+  for (j in 1:P) {
+    beta[j] ~ dnorm(0, 0.01)
+  }
+
+  # Prior for scale parameter (sigma)
+  tau <- pow(sigma, -2)
+  sigma ~ dt(0, pow(2.5, -2), 1) T(0,)  # Half-Cauchy prior
+
+  # Prior for degrees of freedom (nu)
+  nu ~ dexp(1/30) T(2, 100)  # Constrained to be >2
+}
+"
+
+```
+
+```{r}
+# Function to generate initial values
+initialize_jags <- function() {
+  list(
+    beta0 = rnorm(1, 0, 1),
+    beta = rnorm(jags_data$P, 0, 1),
+    sigma = runif(1, 0.1, 5),
+    nu = runif(1, 2, 100)
+  )
+}
+
+```
+
+```{r}
+# Create JAGS model
+jags_model <- jags.model(
+  textConnection(model_code),
+  data = jags_data,
+  inits = initialize_jags,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Burn-in
+update(jags_model, n.iter = 1000)
+
+# MCMC sampling
+mcmc_samples <- coda.samples(
+  model = jags_model,
+  variable.names = c("beta0", "beta", "sigma", "nu"),
+  n.iter = 5000,
+  thin = 5
+)
+
+```
+
+```{r}
+install.packages("ggmcmc")
+```
+
+```{r}
+library(coda)
+par(mfrow = c(3, 3))
+
+# Trace plots
+traceplot(mcmc_samples)
+
+# Autocorrelation plots
+autocorr.plot(mcmc_samples)
+
+# Gelman-Rubin diagnostic
+gelman_results <- gelman.diag(mcmc_samples, multivariate = FALSE)
+print("gelman results")
+print(gelman_results)
+
+# Geweke diagnostic
+geweke_results <- geweke.diag(mcmc_samples)
+print("geweke results")
+print(geweke_results)
+
+
+
+library(knitr)
+
+# Suppose gelman_results and geweke_results are your diagnostic results
+# Gelman-Rubin results often come as a list with an element named $psrf
+kable(gelman_results$psrf, caption = "Gelman-Rubin Diagnostic Results")
+
+# Geweke results may be a list of values per parameter
+# If geweke_results is structured as a named vector or matrix:
+kable(as.data.frame(geweke_results[[1]]), caption = "Geweke Diagnostic Results")
+```
+
+
+```{r}
+# Summarize posterior samples
+posterior_summary <- summary(mcmc_samples)
+print(posterior_summary)
+
+# Extract posterior means and credible intervals
+posterior_means <- posterior_summary$statistics[, "Mean"]
+posterior_sds <- posterior_summary$statistics[, "SD"]
+posterior_cis <- posterior_summary$quantiles[, c("2.5%", "97.5%")]
+
+# Create a summary table
+results_table <- data.frame(
+  Parameter = rownames(posterior_summary$statistics),
+  Mean = posterior_means,
+  SD = posterior_sds,
+  `2.5%` = posterior_cis[, "2.5%"],
+  `97.5%` = posterior_cis[, "97.5%"]
+)
+print(results_table)
+
+```
+
+```{r}
+# Convert mcmc_samples to a matrix and then to a data frame
+mcmc_mat <- as.matrix(mcmc_samples)
+mcmc_df <- as.data.frame(mcmc_mat)
+
+# Rename columns by removing brackets
+colnames(mcmc_df) <- gsub("\\[|\\]", "", colnames(mcmc_df))
+
+# List of parameters to plot
+params <- colnames(mcmc_df)
+
+# Plot posterior densities using a loop
+for (param in params) {
+  plot <- ggplot(mcmc_df, aes(x = .data[[param]])) +
+    geom_density(fill = "blue", alpha = 0.5) +
+    labs(
+      title = paste("Posterior Density of", param),
+      x = param,
+      y = "Density"
+    ) +
+    theme_minimal()
+  
+  print(plot)
+  
+  # Optionally save the plot
+  # ggsave(filename = paste0("posterior_", param, ".png"), plot = plot, width = 8, height = 6)
+}
+
+```
+
+
+### Sensitivity Analysis
+
+```{r}
+# Define alternative model code with tighter priors
+model_code_tighter_priors <- "
+model {
+  for (i in 1:N) {
+    # Likelihood
+    OPS_diff[i] ~ dt(mu[i], tau, nu)
+    mu[i] <- beta0 + inprod(beta[1:P], X[i,])
+  }
+
+  # Priors for coefficients (tighter)
+  beta0 ~ dnorm(0, 0.25)    # Variance = 4 (Precision = 1/4)
+  for (j in 1:P) {
+    beta[j] ~ dnorm(0, 4)    # Variance = 0.25 (Precision = 4)
+  }
+
+  # Prior for scale parameter (sigma) - Half-Cauchy
+  tau <- pow(sigma, -2)
+  sigma ~ dt(0, pow(2.5, -2), 1) T(0,)  # Half-Cauchy prior
+
+  # Prior for degrees of freedom (nu)
+  nu ~ dexp(1/30) T(2, 100)           # Constrained to be >2
+}
+"
+
+# Define alternative model code with wider priors
+model_code_wider_priors <- "
+model {
+  for (i in 1:N) {
+    # Likelihood
+    OPS_diff[i] ~ dt(mu[i], tau, nu)
+    mu[i] <- beta0 + inprod(beta[1:P], X[i,])
+  }
+
+  # Priors for coefficients (wider)
+  beta0 ~ dnorm(0, 0.04)    # Variance = 25 (Precision = 1/25)
+  for (j in 1:P) {
+    beta[j] ~ dnorm(0, 1)    # Variance = 1 (Precision = 1)
+  }
+
+  # Prior for scale parameter (sigma) - Half-Cauchy
+  tau <- pow(sigma, -2)
+  sigma ~ dt(0, pow(2.5, -2), 1) T(0,)  # Half-Cauchy prior
+
+  # Prior for degrees of freedom (nu)
+  nu ~ dexp(1/30) T(2, 100)           # Constrained to be >2
+}
+"
+# Prepare data list for JAGS (assuming final_player_data is already prepared)
+jags_data <- list(
+  N = nrow(final_player_data),
+  OPS_diff = final_player_data$OPS_diff,
+  X = as.matrix(final_player_data[, predictor_vars]),
+  P = length(predictor_vars)
+)
+
+# Function to generate initial values
+initialize_jags <- function() {
+  list(
+    beta0 = rnorm(1, 0, 1),
+    beta = rnorm(jags_data$P, 0, 1),
+    sigma = runif(1, 0.1, 5),
+    nu = runif(1, 2, 100)
+  )
+}
+
+# Fit the original model
+jags_model_original <- jags.model(
+  textConnection(model_code),
+  data = jags_data,
+  inits = initialize_jags(),
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Burn-in
+update(jags_model_original, n.iter = 1000)
+
+# MCMC sampling
+mcmc_original <- coda.samples(
+  model = jags_model_original,
+  variable.names = c("beta0", "beta", "sigma", "nu"),
+  n.iter = 5000,
+  thin = 5
+)
+
+# Fit the model with tighter priors
+jags_model_tighter <- jags.model(
+  textConnection(model_code_tighter_priors),
+  data = jags_data,
+  inits = initialize_jags(),
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Burn-in
+update(jags_model_tighter, n.iter = 1000)
+
+# MCMC sampling
+mcmc_tighter <- coda.samples(
+  model = jags_model_tighter,
+  variable.names = c("beta0", "beta", "sigma", "nu"),
+  n.iter = 5000,
+  thin = 5
+)
+
+# Fit the model with wider priors
+jags_model_wider <- jags.model(
+  textConnection(model_code_wider_priors),
+  data = jags_data,
+  inits = initialize_jags(),
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Burn-in
+update(jags_model_wider, n.iter = 1000)
+
+# MCMC sampling
+mcmc_wider <- coda.samples(
+  model = jags_model_wider,
+  variable.names = c("beta0", "beta", "sigma", "nu"),
+  n.iter = 5000,
+  thin = 5
+)
+
+
+```
+
+```{r}
+# Summarize posterior samples for all models
+summary_original <- summary(mcmc_original)
+summary_tighter <- summary(mcmc_tighter)
+summary_wider <- summary(mcmc_wider)
+
+# Create a comparison table for prior sensitivity
+compare_priors <- data.frame(
+  Parameter = rownames(summary_original$statistics),
+  Original_Mean = summary_original$statistics[, "Mean"],
+  Original_SD = summary_original$statistics[, "SD"],
+  Tighter_Mean = summary_tighter$statistics[, "Mean"],
+  Tighter_SD = summary_tighter$statistics[, "SD"],
+  Wider_Mean = summary_wider$statistics[, "Mean"],
+  Wider_SD = summary_wider$statistics[, "SD"]
+)
+
+print("Comparison of Posterior Estimates Across Different Priors:")
+print(compare_priors)
+
+
+# Combine all MCMC samples into a single data frame with model identifiers
+mcmc_original_df <- as.data.frame(as.matrix(mcmc_original))
+mcmc_original_df$Model <- "Original"
+
+mcmc_tighter_df <- as.data.frame(as.matrix(mcmc_tighter))
+mcmc_tighter_df$Model <- "Tighter Priors"
+
+mcmc_wider_df <- as.data.frame(as.matrix(mcmc_wider))
+mcmc_wider_df$Model <- "Wider Priors"
+
+# Rename columns to remove brackets
+colnames(mcmc_original_df) <- gsub("\\[|\\]", "", colnames(mcmc_original_df))
+colnames(mcmc_tighter_df) <- gsub("\\[|\\]", "", colnames(mcmc_tighter_df))
+colnames(mcmc_wider_df) <- gsub("\\[|\\]", "", colnames(mcmc_wider_df))
+
+# Combine data frames
+combined_priors <- bind_rows(mcmc_original_df, mcmc_tighter_df, mcmc_wider_df)
+combined_models <- bind_rows(combined_priors)
+
+# Reshape data for ggplot2
+library(tidyr)
+plot_params <- c("beta0", "betacoef1", "betacoef2", "betacoef3","betacoef4","betacoef5","betacoef6","betacoef7","betacoef8","betacoef9","betacoef10","betacoef11","betacoef12","betacoef13","betacoef14","betacoef15","betacoef16","betacoef17","alpha")
+
+mcmc_long <- combined_models %>%
+  pivot_longer(cols = c("beta0", "beta1", "beta2","beta3","beta4","beta5","beta6","beta7","beta8","beta9","beta10","beta11","beta12","beta13","beta14","beta15","beta16","beta17", "sigma", "nu"), 
+               names_to = "Parameter", 
+               values_to = "Value")
+
+# Plot density plots with faceting
+ggplot(mcmc_long, aes(x = Value, fill = Model, color = Model)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ Parameter, scales = "free") +
+  labs(
+    title = "Posterior Density Comparison Across Models",
+    x = "Parameter Value",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+```
+```{r}
+kable(compare_priors)
+```
+
+```{r}
+# First, we'll need to shift the OPS_diff data to ensure positivity
+# Find minimum value and add offset to make all values positive
+min_ops <- min(final_player_data$OPS_diff)
+offset <- abs(min_ops) + 0.1  # Adding 0.1 to ensure strictly positive
+shifted_ops <- final_player_data$OPS_diff + offset
+
+# Define the correct predictor variables
+predictor_vars <- c(
+  "SeatingCapacity", "SeatingRowsTypical",
+  "Deck2", "UpperDeck", "LowerDeckShade", "UpperDeckShade", "FairTerritory",
+  "FoulTerritory", "FenceHeightLF", "FenceHeightCF", "FenceHeightRF", "Backstop", 
+  "LeftField", "LeftCenter", "CenterField", "RightCenter", "RightField"
+)
+
+min_ops <- min(final_player_data$OPS_diff)
+offset <- abs(min_ops) + 0.1  # ensure strictly positive
+shifted_ops <- final_player_data$OPS_diff + offset
+
+jags_data_gamma <- list(
+  N = nrow(final_player_data),
+  OPS_diff_shifted = shifted_ops,
+  X = as.matrix(final_player_data[, predictor_vars]),
+  P = length(predictor_vars),
+  offset = offset
+)
+
+### Original (Reference) Model Code (Informed priors) ###
+model_code_original <- "
+model {
+  alpha ~ dgamma(2, 0.5)  
+  for (i in 1:N) {
+    OPS_diff_shifted[i] ~ dgamma(alpha, beta[i])
+    log(beta[i]) <- beta0 + inprod(betacoef[1:P], X[i,])
+  }
+  
+  # Intercept
+  beta0 ~ dnorm(0, 0.1)
+  
+  # Informed priors as per your original code
+  betacoef[1] ~ dnorm(-0.1, 4)   
+  betacoef[2] ~ dnorm(-0.05, 16) 
+  betacoef[3] ~ dnorm(-0.1, 4)
+  betacoef[4] ~ dnorm(-0.15, 4)
+  betacoef[5] ~ dnorm(-0.2, 9)   
+  betacoef[6] ~ dnorm(-0.2, 9)   
+  betacoef[7] ~ dnorm(0.1, 4)    
+  betacoef[8] ~ dnorm(0.1, 4)    
+  betacoef[9] ~ dnorm(-0.15, 4)  
+  betacoef[10] ~ dnorm(-0.2, 4)  
+  betacoef[11] ~ dnorm(-0.15, 4) 
+  betacoef[12] ~ dnorm(-0.05, 16)
+  betacoef[13] ~ dnorm(-0.1, 4)  
+  betacoef[14] ~ dnorm(-0.1, 4)  
+  betacoef[15] ~ dnorm(-0.15, 4) 
+  betacoef[16] ~ dnorm(-0.1, 4)  
+  betacoef[17] ~ dnorm(-0.1, 4)  
+}
+"
+
+### Less Informative (Wider) Priors ###
+model_code_wider <- "
+model {
+  alpha ~ dgamma(2, 0.5)
+  for (i in 1:N) {
+    OPS_diff_shifted[i] ~ dgamma(alpha, beta[i])
+    log(beta[i]) <- beta0 + inprod(betacoef[1:P], X[i,])
+  }
+  
+  beta0 ~ dnorm(0, 0.01)    # Var = 100
+  for (j in 1:P) {
+    betacoef[j] ~ dnorm(0, 0.01) # Var = 100
+  }
+}
+"
+
+### More Informative (Tighter) Priors ###
+model_code_tighter <- "
+model {
+  alpha ~ dgamma(2, 0.5)
+  for (i in 1:N) {
+    OPS_diff_shifted[i] ~ dgamma(alpha, beta[i])
+    log(beta[i]) <- beta0 + inprod(betacoef[1:P], X[i,])
+  }
+  
+  beta0 ~ dnorm(0, 1)     # Var = 1
+  for (j in 1:P) {
+    betacoef[j] ~ dnorm(0, 10) # Var = 0.1
+  }
+}
+"
+
+### Very Uninformative Priors ###
+# Here we use extremely flat priors, e.g. dnorm(0, 0.0001) ~ Normal with Var = 10,000
+# This is likely so broad that the data should dominate entirely.
+model_code_very_uninform <- "
+model {
+  alpha ~ dgamma(2, 0.5)
+  for (i in 1:N) {
+    OPS_diff_shifted[i] ~ dgamma(alpha, beta[i])
+    log(beta[i]) <- beta0 + inprod(betacoef[1:P], X[i,])
+  }
+  
+  beta0 ~ dnorm(0, 0.0001)   # Var = 10,000
+  for (j in 1:P) {
+    betacoef[j] ~ dnorm(0, 0.0001) # Var = 10,000
+  }
+}
+"
+
+# Initialization function
+initialize_jags_gamma <- function() {
+  list(
+    beta0 = rnorm(1, 0, 1),
+    betacoef = rnorm(jags_data_gamma$P, 0, 1),
+    alpha = rgamma(1, 2, 0.5)
+  )
+}
+
+# Fit original model
+jags_model_original <- jags.model(
+  textConnection(model_code_original),
+  data = jags_data_gamma,
+  inits = initialize_jags_gamma,
+  n.chains = 3,
+  n.adapt = 1000
+)
+update(jags_model_original, n.iter = 1000) 
+mcmc_original <- coda.samples(
+  model = jags_model_original,
+  variable.names = c("beta0", "betacoef", "alpha"),
+  n.iter = 5000,
+  thin = 5
+)
+
+# Fit wider model
+jags_model_wider <- jags.model(
+  textConnection(model_code_wider),
+  data = jags_data_gamma,
+  inits = initialize_jags_gamma,
+  n.chains = 3,
+  n.adapt = 1000
+)
+update(jags_model_wider, n.iter = 1000)
+mcmc_wider <- coda.samples(
+  model = jags_model_wider,
+  variable.names = c("beta0", "betacoef", "alpha"),
+  n.iter = 5000,
+  thin = 5
+)
+
+# Fit tighter model
+jags_model_tighter <- jags.model(
+  textConnection(model_code_tighter),
+  data = jags_data_gamma,
+  inits = initialize_jags_gamma,
+  n.chains = 3,
+  n.adapt = 1000
+)
+update(jags_model_tighter, n.iter = 1000)
+mcmc_tighter <- coda.samples(
+  model = jags_model_tighter,
+  variable.names = c("beta0", "betacoef", "alpha"),
+  n.iter = 5000,
+  thin = 5
+)
+
+# Fit very uninformative model
+jags_model_very_uninform <- jags.model(
+  textConnection(model_code_very_uninform),
+  data = jags_data_gamma,
+  inits = initialize_jags_gamma,
+  n.chains = 3,
+  n.adapt = 1000
+)
+update(jags_model_very_uninform, n.iter = 1000)
+mcmc_very_uninform <- coda.samples(
+  model = jags_model_very_uninform,
+  variable.names = c("beta0", "betacoef", "alpha"),
+  n.iter = 5000,
+  thin = 5
+)
+
+# Summaries
+summary_original <- summary(mcmc_original)
+summary_wider <- summary(mcmc_wider)
+summary_tighter <- summary(mcmc_tighter)
+summary_very_uninform <- summary(mcmc_very_uninform)
+
+# Create comparison table
+parameter_names <- c("beta0", paste0("betacoef[", 1:jags_data_gamma$P, "]"), "alpha")
+
+compare_priors <- data.frame(
+  Parameter = parameter_names,
+  Original_Mean = summary_original$statistics[,"Mean"],
+  Original_SD = summary_original$statistics[,"SD"],
+  Wider_Mean = summary_wider$statistics[,"Mean"],
+  Wider_SD = summary_wider$statistics[,"SD"],
+  Tighter_Mean = summary_tighter$statistics[,"Mean"],
+  Tighter_SD = summary_tighter$statistics[,"SD"],
+  VeryUninform_Mean = summary_very_uninform$statistics[,"Mean"],
+  VeryUninform_SD = summary_very_uninform$statistics[,"SD"]
+)
+
+print("Comparison of Posterior Estimates Across Different Priors:")
+print(compare_priors)
+
+# Combine MCMC samples into a single data frame
+mcmc_original_df <- as.data.frame(as.matrix(mcmc_original))
+mcmc_original_df$Model <- "Original"
+
+mcmc_wider_df <- as.data.frame(as.matrix(mcmc_wider))
+mcmc_wider_df$Model <- "Wider"
+
+mcmc_tighter_df <- as.data.frame(as.matrix(mcmc_tighter))
+mcmc_tighter_df$Model <- "Tighter"
+
+mcmc_very_uninform_df <- as.data.frame(as.matrix(mcmc_very_uninform))
+mcmc_very_uninform_df$Model <- "Very Uninformative"
+
+# Clean column names
+colnames(mcmc_original_df) <- gsub("\\[|\\]", "", colnames(mcmc_original_df))
+colnames(mcmc_wider_df) <- gsub("\\[|\\]", "", colnames(mcmc_wider_df))
+colnames(mcmc_tighter_df) <- gsub("\\[|\\]", "", colnames(mcmc_tighter_df))
+colnames(mcmc_very_uninform_df) <- gsub("\\[|\\]", "", colnames(mcmc_very_uninform_df))
+
+# Combine all MCMC samples
+combined <- bind_rows(mcmc_original_df, mcmc_wider_df, mcmc_tighter_df, mcmc_very_uninform_df)
+
+
+```
+
+```{r}
+# Select some parameters to plot
+plot_params <- c("beta0", "betacoef1", "betacoef2", "betacoef3","betacoef4","betacoef5","betacoef6","betacoef7","betacoef8","betacoef9","betacoef10","betacoef11","betacoef12","betacoef13","betacoef14","betacoef15","betacoef16","betacoef17","alpha")
+
+mcmc_long <- combined %>%
+  pivot_longer(cols = plot_params, names_to = "Parameter", values_to = "Value")
+
+# Plot the densities
+ggplot(mcmc_long, aes(x = Value, fill = Model, color = Model)) +
+  geom_density(alpha = 0.3) +
+  facet_wrap(~ Parameter, scales = "free") +
+  labs(
+    title = "Posterior Density Comparison Across Different Priors (Gamma Model)",
+    x = "Parameter Value",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+kable(compare_priors)
+
+```
+
+```{r}
+par(mfrow = c(3, 3))
+# Trace plots
+traceplot(mcmc_samples_informed)
+
+# Autocorrelation plots
+autocorr.plot(mcmc_samples_informed)
+
+# Gelman-Rubin diagnostic
+gelman_results <- gelman.diag(mcmc_samples_informed, multivariate = FALSE)
+print("gelman results")
+kable(gelman_results$psrf, caption = "Gelman-Rubin Diagnostic Results")
+
+# Geweke diagnostic
+geweke_results <- geweke.diag(mcmc_samples_informed)
+print("geweke results")
+print(geweke_results)
+```
+
+# Question 2 - Aditya Daga
+
+##2
+
+The question:
+
+Does a team’s home run rate change significantly when playing at their
+home stadium versus away stadiums?
+
+##3
+
+Response Variable:
+
+-   Team.R (Total runs scored by the batter's team in the game).
+
+Predictor Variables:
+
+-   H.A: Home or Away (binary: 0 for Away, 1 for Home).
+
+-   Opponent.Strength: Standardized Moneyline column to measure how
+    favored or underdog the team was
+
+    -   Opponent Strength = (Moneyline - mean(Moneyline))/sd(Moneyline)
+
+    -   Lower values (e.g., negative moneyline) imply stronger teams
+        (favored)
+
+    -   Higher values (e.g., positive moneyline) imply weaker teams
+        (underdogs).
+
+We will choose the Negative Binomial distribution for the Bayesian model
+because it is well-suited for the type of data and the underlying
+characteristics of the problem
+
+The outcome variable, Team.R (total runs scored), is a count variable
+that can take on non-negative integer values (0, 1, 2, ...). This makes
+the Poisson family of distributions (which models count data) a natural
+choice. However, the Poisson distribution assumes the mean equals the
+variance, which may not hold in real-world data, particularly in
+baseball.
+
+In baseball data, there is often overdispersion, meaning that the
+variance of the count data is greater than the mean. This happens
+because team performance can vary widely based on factors such as player
+skill, park effects, and opponent strength. Also, external conditions,
+such as weather or game strategy, may also introduce variability.
+
+The expected number of runs is modeled on the log scale as:
+
+$$
+\log(\mu_i) = \beta_0 + \beta_1 \cdot H.A_i + \beta_2 \cdot \text{Opponent.Strength}_i
+$$
+
+Where B0 is Baseline log-run rate for Away games, B1 is the additional
+effect of playing at Home, and B2 is the effect of Opponent Strength
+(positive/negative impact on run rate).
+
+Our assumption is that home advantage increases the run rate (a positive
+B1) and that stronger opponents supress the run rate (a negative B2)
+
+Additionally, our likelihood is given by:
+
+$$
+\text{Team.R}_i \sim \text{NegativeBinomial}(\mu_i, \phi)
+$$
+
+Where:
+
+$$
+\mu_i = e^{\log(\mu_i)}: \text{Mean runs for team } i.
+$$
+
+And:
+
+$$
+\phi: \text{Dispersion parameter to model overdispersion.}
+$$
+
+##4
+
+Let's begin verifying our model assumptions:
+
+```{r}
+combined_data <- combined_data %>%
+  mutate(Moneyline = as.numeric(as.character(Moneyline)))
+
+if (any(is.na(combined_data$Moneyline))) {
+  warning("Some Moneyline values could not be converted to numeric. Please check for invalid entries.")
+}
+
+# Standardize Moneyline to create Opponent.Strength predictor
+combined_data <- combined_data %>%
+  mutate(Opponent.Strength = (Moneyline - mean(Moneyline, na.rm = TRUE)) / sd(Moneyline, na.rm = TRUE))
+
+```
+
+We have standarized the Moneyline column above.
+
+Since the Negative Binomial distribution assumes count data with
+overdispersion, it is important to verify if Team.R matches this
+pattern.
+
+```{r}
+ggplot(combined_data, aes(x = Team.R)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "white", alpha = 0.7) +
+  labs(
+    title = "Distribution of Team Runs Scored (Team.R)",
+    x = "Total Runs Scored",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+While the Poisson distribution is often used for count data, the
+observed variance in the data (evident from the long tail) suggests
+overdispersion (variance exceeding the mean). This makes the Negative
+Binomial distribution a better fit, as it can accommodate overdispersion
+by introducing an additional parameter for variance.
+
+Next, we will evaluate the relationship Between Predictors and Response.
+We will examine whether H.A (Home vs. Away) and Opponent.Strength are
+related to Team.R. We will use boxplots and scatterplots to visualize
+these relationships.
+
+```{r}
+ggplot(combined_data, aes(x = H.A, y = Team.R, fill = H.A)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "red") +
+  labs(
+    title = "Runs Scored (Team.R) by Home/Away",
+    x = "Home or Away",
+    y = "Total Runs Scored"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(values = c("blue", "green"))
+
+```
+
+
+
+```{r}
+ggplot(combined_data, aes(x = Opponent.Strength, y = Team.R)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(
+    title = "Relationship Between Opponent Strength and Runs Scored",
+    x = "Opponent Strength (Standardized Moneyline)",
+    y = "Total Runs Scored"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+The boxplot of Team.R (Total Runs Scored) grouped by H.A (Home vs. Away)
+reveals that there is a slight difference in the median runs scored
+between home and away games, with teams generally scoring marginally
+more runs at home. This supports the inclusion of H.A as a predictor in
+the model, as it suggests a potential relationship between playing
+location and scoring outcomes. The scatterplot of Team.R against
+Opponent.Strength (standardized Moneyline) shows a slight negative
+trend, indicating that as the opponent's strength increases (lower
+Moneyline values), the runs scored by the team decrease. This aligns
+with the hypothesis that stronger opponents suppress team performance,
+justifying the inclusion of Opponent.Strength as a predictor in the
+model. Together, these visualizations provide preliminary evidence
+supporting the relevance of the chosen predictors and the assumptions
+underlying the model structure.
+
+Lastly, we will assess overdispersion in the Response Variable by
+comparing the variance and mean of Team.R. Oversdispertion is a part of
+our assumption of the Negative Binomial model. Additionally, we will
+plot the mean-variance relationship.
+
+```{r}
+mean_var_summary <- combined_data %>%
+  group_by(H.A) %>%
+  summarise(
+    Mean = mean(Team.R, na.rm = TRUE),
+    Variance = var(Team.R, na.rm = TRUE)
+  )
+
+# Print mean and variance summary
+print(mean_var_summary)
+
+```
+
+The mean-variance relationship of the Team.R variable for home (H) and
+away (A) games shows that the variance is greater than the mean in both
+cases, with a variance of 10.805 for away games and 10.534 for home
+games, compared to means of 4.660 and 4.744, respectively. This
+observation indicates overdispersion, where the variability in the data
+exceeds what would be expected under a Poisson distribution, which
+assumes equality of mean and variance. The negative binomial model
+accounts for this overdispersion by introducing an additional parameter
+to model variability beyond the mean. Therefore, the negative binomial
+model is an appropriate choice for modeling the total runs scored
+(Team.R), as it better captures the observed variability in the data.
+
+##5
+
+We will set priors for the coefficients (B0, B1, B2) and the
+overdispersion parameter (α) based on the context of our data. Here's
+the plan:
+
+-   Baseline Log-Run Rate (B0)
+
+    -   We assume the baseline log-run rate to have a weakly informative
+        prior, as we do not have strong prior knowledge about the
+        average runs scored per game.
+
+    -   Prior: B0∼N(0,2^2)(mean = 0, standard deviation = 2)
+
+-   Effect of Playing at Home (B1)
+
+    -   The effect of playing at home is expected to be small but
+        positive, as home-field advantage in sports is generally small.
+
+    -   Prior: B1∼N(0,0.5^2)(mean = 0, standard deviation = 0.5)
+
+-   Effect of Opponent Strength (B2):
+
+    -   Opponent strength is standardized, and we assume a weak prior
+        centered around zero since its effect on runs scored is
+        uncertain
+
+    -   Prior: B2∼N(0,1^2)(mean = 0, standard deviation = 1)
+
+-   Overdispersion Parameter (α):
+
+    -   The overdispersion parameter is constrained to be positive and
+        reflects the variability in the run count. A weakly informative
+        prior will be used to allow flexibility.
+
+    -   Prior: α∼Gamma(2,0.5) (shape = 2, rate = 0.5), allowing a broad
+        range of values with higher likelihood near small positive
+        values.
+
+We will plot the prior densities for each parameter to confirm that they
+align with our expectations and assumptions about the model.
+
+```{r}
+library(ggplot2)
+
+beta_prior <- data.frame(
+  beta0 = rnorm(10000, mean = 0, sd = 2),
+  beta1 = rnorm(10000, mean = 0, sd = 0.5),
+  beta2 = rnorm(10000, mean = 0, sd = 1)
+)
+
+ggplot(beta_prior, aes(x = beta0)) +
+  geom_density(color = "blue", fill = "blue", alpha = 0.3) +
+  labs(title = "Prior for β0 (Baseline Log-Run Rate)", x = "β0", y = "Density")
+
+ggplot(beta_prior, aes(x = beta1)) +
+  geom_density(color = "green", fill = "green", alpha = 0.3) +
+  labs(title = "Prior for β1 (Effect of Playing at Home)", x = "β1", y = "Density")
+
+ggplot(beta_prior, aes(x = beta2)) +
+  geom_density(color = "purple", fill = "purple", alpha = 0.3) +
+  labs(title = "Prior for β2 (Effect of Opponent Strength)", x = "β2", y = "Density")
+
+alpha_prior <- data.frame(alpha = rgamma(10000, shape = 2, rate = 0.5))
+
+ggplot(alpha_prior, aes(x = alpha)) +
+  geom_density(color = "red", fill = "red", alpha = 0.3) +
+  labs(title = "Prior for α (Overdispersion)", x = "α", y = "Density")
+
+```
+
+##6
+
+Plan for posterior inference:
+
+We plan to implement posterior inference using Markov Chain Monte Carlo
+methods, specifically utilizing Gibbs sampling through the rjags package
+in R. Our goal will be to estimate the posterior distributions of the
+model parameters: the intercept (beta0), the effect of playing at home
+versus away (beta1), the effect of opponent strength (beta2), and the
+overdispersion parameter (alpha) for a negative binomial regression
+model. By using the MCMC algorithm, we will approximate the joint
+posterior distributions of these parameters by generating samples from
+their probability distributions conditional on the observed data.
+
+To ensure efficient and reliable posterior inference, we will use three
+chains with random initial values and an adaptive burn-in phase to allow
+the chains to reach their stationary distribution. After the burn-in, we
+will run the MCMC chains for 3,000 iterations per chain with a thinning
+interval of 5 to reduce autocorrelation between consecutive samples. To
+diagnose convergence and ensure the accuracy of our posterior estimates,
+we will examine trace plots, autocorrelation plots, and use diagnostic
+tests, such as the Geweke diagnostic and the Gelman-Rubin diagnostic.
+These steps will help us verify that the chains have converged and
+provide robust posterior estimates.
+
+##7
+
+```{r}
+library(rjags)
+library(coda)
+library(ggplot2)
+library(dplyr)
+
+filtered_data <- combined_data %>%
+  filter(!is.na(Opponent.Strength))
+
+jags_data <- list(
+  Team_R = filtered_data$Team.R,
+  Home_Away = as.numeric(filtered_data$H.A == "H"),
+  Opponent_Strength = filtered_data$Opponent.Strength,
+  N = nrow(filtered_data) # Number of observations
+)
+
+model_code <- "
+model {
+  for (i in 1:N) {
+    Team_R[i] ~ dnegbin(prob[i], alpha)
+    prob[i] <- alpha / (alpha + mu[i])
+    log(mu[i]) <- beta0 + beta1 * Home_Away[i] + beta2 * Opponent_Strength[i]
+  }
+
+  # Updated priors for the regression coefficients
+  beta0 ~ dnorm(0, 0.25)    # Weakly informative prior: mean = 0, sd = 2
+  beta1 ~ dnorm(0, 4)       # Weakly informative prior: mean = 0, sd = 0.5
+  beta2 ~ dnorm(0, 1)       # Weakly informative prior: mean = 0, sd = 1
+
+  # Updated prior for the overdispersion parameter
+  alpha ~ dgamma(2, 0.5)    # Weakly informative Gamma prior: shape = 2, rate = 0.5
+}
+"
+
+initialize_jags <- function() {
+  list(
+    beta0 = rnorm(1, 0, 1), 
+    beta1 = rnorm(1, 0, 0.2), 
+    beta2 = rnorm(1, 0, 0.5), 
+    alpha = rgamma(1, 2, 0.5)
+  )
+}
+
+jags_model <- jags.model(
+  textConnection(model_code),
+  data = jags_data,
+  inits = initialize_jags,
+  n.chains = 3,      
+  n.adapt = 500      
+)
+
+update(jags_model, 500)  
+
+mcmc_samples <- coda.samples(
+  jags_model,
+  variable.names = c("beta0", "beta1", "beta2", "alpha"),
+  n.iter = 3000,     # Further reduced iterations
+  thin = 5           # Increased thinning to reduce autocorrelation
+)
+
+traceplot(mcmc_samples)
+
+autocorr.plot(mcmc_samples)
+
+geweke_results <- geweke.diag(mcmc_samples)
+print(geweke_results)
+
+gelman_results <- gelman.diag(mcmc_samples, multivariate = FALSE)
+print(gelman_results)
+
+summary(mcmc_samples)
+
+mcmc_df <- as.data.frame(as.matrix(mcmc_samples))
+mcmc_df$Iteration <- 1:nrow(mcmc_df)
+
+ggplot(mcmc_df, aes(x = Iteration)) +
+  geom_line(aes(y = beta0, color = "beta0")) +
+  geom_line(aes(y = beta1, color = "beta1")) +
+  geom_line(aes(y = beta2, color = "beta2")) +
+  geom_line(aes(y = alpha, color = "alpha")) +
+  labs(
+    title = "Trace Plots for MCMC Chains",
+    x = "Iteration",
+    y = "Parameter Value",
+    color = "Parameter"
+  ) +
+  theme_minimal()
+
+
+```
+
+The trace plots for the parameters alpha, beta0, beta1, and beta2 show
+good mixing, with the chains exploring the parameter space without
+significant trends or drifts. This indicates that the MCMC sampling is
+converging, and the chains have likely reached their stationary
+distribution. The absence of distinct upward or downward trends in the
+traces further supports convergence.
+
+The autocorrelation plots reveal that all the parameters exhibit minimal
+autocorrelation across lags. This suggests that the chains are sampling
+effectively with reduced dependence between successive iterations. Lower
+autocorrelation is desirable as it means the samples are more
+independent, leading to better posterior estimation.
+
+Geweke Diagnostic: The Geweke diagnostic results for the parameters show
+that the z-scores are within an acceptable range (close to zero),
+indicating no significant difference between the means of the first and
+last portions of the chains. This further supports the conclusion that
+the chains have converged.
+
+alpha: z-scores range around ±0.5
+beta0: Mixed but within reasonable bounds
+beta1 and beta2: Also within acceptable ranges. The
+Geweke diagnostic does not suggest any issues with convergence.
+
+The Gelman-Rubin diagnostic shows that all parameters have Potential
+Scale Reduction Factor values close to 1:
+
+alpha: Point estimate = 1.00, Upper CI = 1.01 beta0: Point estimate =
+1.01, Upper CI = 1.02 beta1: Point estimate = 1.01, Upper CI = 1.03
+beta2: Point estimate = 1.00, Upper CI = 1.02
+
+These values indicate that the chains have converged across the three
+chains, with no significant variance between them. A PSRF value close to
+1 signifies good convergence.
+
+The summary statistics show small standard errors, narrow credible
+intervals, and consistent means across chains. For example:
+
+alpha: Mean = 3.70674, 2.5% quantile = 3.6556, 97.5% quantile = 3.75785.
+beta0: Mean = 1.54287, 2.5% quantile = 1.5374, 97.5% quantile = 1.54799.
+beta1: Mean = -0.04024, 2.5% quantile = -0.0475, 97.5% quantile =
+-0.03242. 
+beta2: Mean = -0.10238, 2.5% quantile = -0.1063, 97.5%
+quantile = -0.09840.
+
+This shows that the posterior distributions are well-defined with no
+apparent anomalies.
+
+##8
+
+```{r}
+library(ggplot2)
+
+posterior_summary <- summary(mcmc_samples)
+
+posterior_means <- posterior_summary$statistics[, "Mean"]
+posterior_sd <- posterior_summary$statistics[, "SD"]
+posterior_ci <- apply(as.matrix(mcmc_samples), 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+
+print("Posterior Means:")
+print(posterior_means)
+print("Posterior Standard Deviations:")
+print(posterior_sd)
+print("95% Credible Intervals:")
+print(posterior_ci)
+
+posterior_df <- as.data.frame(as.matrix(mcmc_samples))
+params <- colnames(posterior_df)
+
+for (param in params) {
+  plot <- ggplot(posterior_df, aes_string(x = param)) +
+    geom_histogram(aes(y = ..density..), bins = 30, fill = "blue", alpha = 0.7) +
+    geom_density(color = "red", size = 1) +
+    labs(
+      title = paste("Posterior Density of", param),
+      x = param,
+      y = "Density"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  print(plot)
+  
+  ggsave(filename = paste0("posterior_", param, ".png"), plot = plot, width = 8, height = 6)
+}
+
+for (param in params) {
+  cat("Posterior summary for", param, ":\n")
+  cat("  Mean:", mean(posterior_df[[param]]), "\n")
+  cat("  Median:", median(posterior_df[[param]]), "\n")
+  cat("  Mode (approx):", density(posterior_df[[param]])$x[which.max(density(posterior_df[[param]])$y)], "\n")
+  cat("  95% CI:", quantile(posterior_df[[param]], probs = c(0.025, 0.975)), "\n\n")
+}
+
+
+```
+
+
+
+
+Alpha (Overdispersion Parameter):
+
+The posterior density of alpha is unimodal, symmetric, and appears approximately Gaussian. The mean, median, and mode of alpha are closely aligned (mean ≈ 3.754), indicating strong agreement between central tendency measures. The 95% credible interval (3.7117, 3.7997) suggests that the variability is well constrained. Given the prior assumption of a Gamma(2, 0.5) distribution, the posterior density concentrates in a realistic range, confirming that the data supports a moderate overdispersion in team runs.
+
+Beta0 (Baseline Log-Run Rate for Away Games):
+The posterior density for beta0 is sharply peaked, symmetric, and Gaussian-like. The mean, median, and mode are almost identical (mean ≈ 1.569), indicating stability.The 95% credible interval (1.5644, 1.5728) is narrow, suggesting high certainty in the baseline away log-run rate. Compared to the prior, the posterior concentrates near the empirical average for runs scored, aligning well with prior expectations and the data.
+
+
+Beta1 (Home Effect on Log-Run Rate):
+The posterior density of beta1 is negative, symmetric, and tightly concentrated (mean ≈ -0.051), with a narrow 95% credible interval (-0.0576, -0.0455).This suggests a small but statistically significant negative effect of being the home team on run rates.
+The result is surprising. While prior beliefs might expect a positive beta1 (home-field advantage), this negative value may indicate that run production is relatively suppressed for the home team, potentially due to league-wide biases, park effects, or other game-level factors. This negative beta1 merits further investigation.
+
+Beta2 (Opponent Strength Effect on Log-Run Rate):
+The posterior density for beta2 is symmetric, negative, and narrow (mean ≈ -0.106), with a 95% credible interval (-0.1088, -0.1025).This indicates a small but significant negative effect of opponent strength (stronger opponents decrease the team's run rate).
+This finding aligns with prior intuition that facing a stronger opponent (lower Opponent.Strength) suppresses a team's scoring performance. The tight credible interval indicates a strong signal in the data.
+
+##9
+
+Sensitivity Analysis
+
+```{r}
+library(rjags)
+library(coda)
+library(ggplot2)
+library(dplyr)
+
+filtered_data <- combined_data %>%
+  filter(!is.na(Opponent.Strength))
+
+jags_data <- list(
+  Team_R = filtered_data$Team.R,
+  Home_Away = as.numeric(filtered_data$H.A == "H"),
+  Opponent_Strength = filtered_data$Opponent.Strength,
+  N = nrow(filtered_data) # Number of observations
+)
+
+model_code_non_informative <- "
+model {
+  for (i in 1:N) {
+    Team_R[i] ~ dnegbin(prob[i], alpha)
+    prob[i] <- alpha / (alpha + mu[i])
+    log(mu[i]) <- beta0 + beta1 * Home_Away[i] + beta2 * Opponent_Strength[i]
+  }
+
+  # Non-informative priors
+  beta0 ~ dnorm(0, 0.0001)
+  beta1 ~ dnorm(0, 0.0001)
+  beta2 ~ dnorm(0, 0.0001)
+  alpha ~ dunif(0.01, 10)
+}
+"
+
+model_code_informed <- "
+model {
+  for (i in 1:N) {
+    Team_R[i] ~ dnegbin(prob[i], alpha)
+    prob[i] <- alpha / (alpha + mu[i])
+    log(mu[i]) <- beta0 + beta1 * Home_Away[i] + beta2 * Opponent_Strength[i]
+  }
+
+  # Informed priors
+  beta0 ~ dnorm(1.5685, 1/(0.0021^2))  # Based on partially informed prior mean and variance
+  beta1 ~ dnorm(-0.0513, 1/(0.0031^2)) # Based on partially informed prior mean and variance
+  beta2 ~ dnorm(-0.1056, 1/(0.0016^2)) # Based on partially informed prior mean and variance
+  alpha ~ dgamma(2, 0.5)               # Based on prior information about dispersion
+}
+"
+
+run_mcmc <- function(model_code) {
+  jags_model <- jags.model(
+    textConnection(model_code),
+    data = jags_data,
+    n.chains = 3,      # Use 3 chains for better diagnostics
+    n.adapt = 500      # Adaptation phase
+  )
+  
+  update(jags_model, 500)
+  
+  mcmc_samples <- coda.samples(
+    jags_model,
+    variable.names = c("beta0", "beta1", "beta2", "alpha"),
+    n.iter = 3000,
+    thin = 5
+  )
+  
+  return(mcmc_samples)
+}
+
+mcmc_non_informative <- run_mcmc(model_code_non_informative)
+mcmc_informed <- run_mcmc(model_code_informed)
+```
+
+```{r}
+library(ggplot2)
+
+posterior_non_informative <- as.data.frame(as.matrix(mcmc_non_informative))
+posterior_informed <- as.data.frame(as.matrix(mcmc_informed))
+
+posterior_non_informative$type <- "Non-Informative Prior"
+posterior_informed$type <- "Informed Prior"
+posterior_df$type <- "Original, partially informed Prior"
+combined_posterior <- rbind(posterior_non_informative, posterior_informed, posterior_df)
+
+params <- c("beta0", "beta1", "beta2", "alpha")
+
+for (param in params) {
+  plot <- ggplot(combined_posterior, aes_string(x = param, fill = "type")) +
+    geom_density(alpha = 0.5) +
+    labs(
+      title = paste("Posterior Comparison for", param),
+      x = param,
+      y = "Density"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  print(plot)
+  
+  ggsave(filename = paste0("sensitivity_", param, ".png"), plot = plot, width = 8, height = 6)
+}
+
+cat("\nSummary for Non-Informative Priors:\n")
+print(summary(mcmc_non_informative))
+
+cat("\nSummary for Informed Priors:\n")
+print(summary(mcmc_informed))
+```
+
+# Question3 - Brandon Fantine
+
+```{r}
+
+# Load and clean data
+hitter_data <- as.data.frame(read.csv("combineddata.csv"))
+
+hitter_data$Pitch.Hand <- str_extract(hitter_data$Starting.Pitcher, '([RL])')
+
+# Select relevant variables
+cleaned_data <- hitter_data %>% 
+  filter(!is.na(BA) & !is.na(Pitch.Hand) & !is.na(Stadium) & 
+           !str_detect(Stadium, '[0-9]'))
+
+# Convert categorical variables
+cleaned_data$Stadium <- as.factor(cleaned_data$Stadium)
+cleaned_data$H.A <- as.factor(cleaned_data$H.A)
+cleaned_data$Pitch.Hand <- as.factor(cleaned_data$Pitch.Hand)
+
+```
+
+Let us create a knitr table for brief analysis.
+
+```{r}
+
+knitr::kable(cleaned_data %>%
+               select(Player, Stadium, Pitch.Hand, HR) %>%
+               group_by(Player, Stadium, Pitch.Hand, HR) %>%
+               arrange(Player, Stadium, Pitch.Hand, HR), "simple")
+
+```
+
+## Bayesian Analysis 1: HR v. Stadiums, Normal Prior
+
+Let us begin our Bayesian analysis by identifying the relationship between HR counts (NOT RATES) and the stadiums themselves. 
+
+```{r}
+
+# Prepare data for JAGS
+N <- nrow(cleaned_data)
+stadium_levels <- as.integer(factor(cleaned_data$Stadium))
+pitch_hand <- as.integer(factor(cleaned_data$Pitch.Hand))
+K <- length(unique(stadium_levels))
+HR <- cleaned_data$HR
+
+```
+
+## Bayesian Analysis 2: HR v. Stadiums, Poisson Prior
+
+That wasn't very accurate, but was a worthy practice! Since sigma wasn't incredibly far from 0, we can assume that there reasonably exists a relationship between HR and Stadiums; if sigma was 1, the relationship would be purely random (and if it was 0, it would be contradictory to our posterior predictive plot). Our endavor has worth. 
+
+Consider that the data is dispersed across the values of 0, 1, 2, 3, and 4 discretely: they are non-continuous. We should choose a prior accordingly. This directs us towards a negative-binomial distribution *or* a poisson distribution. A poisson prior assumes that the mean and variance are the same for HR rates. Let us look at our given data for reference.
+
+```{r}
+
+abs(sd(cleaned_data$HR)^2 - mean(cleaned_data$HR))
+
+```
+
+The variance and mean of our observed are shockingly close, only differing by 0.0029! This gives us grounds to investigate using a poisson prior. 
+
+```{r}
+
+# Define the JAGS model with Poisson likelihood
+poisson_uninformative_code <- "
+model {
+  for (i in 1:N) {
+    # Poisson likelihood
+    HR[i] ~ dpois(mu[i])
+    
+    # Link function for the mean
+    log(mu[i]) <- alpha[stadium[i]]
+  }
+  
+  # Priors for alpha (stadium effects)
+  for (j in 1:K) {
+    alpha[j] ~ dnorm(0, 1)  # Weakly informative normal prior
+  }
+}
+"
+
+# Initialize data for JAGS
+poisson_data <- list(
+  N = N,    
+  K = K,       
+  HR = HR,
+  stadium = stadium_levels
+)
+
+# Define initial values
+inits <- function() {
+  list(
+    alpha = rnorm(K, 0, 1)
+  )
+}
+
+# Run the Gibbs sampler
+poisson_uninformative <- jags.model(
+  textConnection(poisson_uninformative_code),
+  data = poisson_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Update the model (burn-in period)
+update(poisson_uninformative, 1000)
+
+# Sample from the posterior
+poisson_uninformative_results <- coda.samples(
+  poisson_uninformative,
+  variable.names = c("alpha"),
+  n.iter = 5000
+)
+
+autocorr.plot(poisson_uninformative_results)
+
+poisson_uninformative_dic <- dic.samples(poisson_uninformative, n.iter = 1000)
+print(poisson_uninformative_dic)
+
+# Analysis of results
+summary(poisson_uninformative_results)
+
+# All converged (can double check with gelman.diag() but that isn't necessary)
+plot(poisson_uninformative_results)
+
+gelman.diag(poisson_uninformative_results)
+
+# Least influential stadium #2 - Busch Stadium
+# Mean = -2.802
+# All stadiums have negative influence on HR rates!
+plot(poisson_uninformative_results[, "alpha[2]"])
+
+# Posterior Predictive distribution mapping for a Poisson prior
+posterior_means <- colMeans(as.matrix(poisson_uninformative_results))
+alpha_means <- posterior_means[1:K]
+simulated_HR <- numeric(N)
+for (i in 1:N) {
+  stadium_idx <- stadium_levels[i]
+  mu <- exp(alpha_means[stadium_idx])
+  simulated_HR[i] <- rpois(1, lambda = mu)
+}
+
+# Plot the posterior predictive check
+hist(simulated_HR, probability = TRUE, col = "blue", main = "Posterior Predictive Check")
+lines(density(HR), col = "red", lwd = 2)
+
+```
+
+We see decent success from the above posterior predictive mapping, but it's not perfect.
+
+## Sensitivity Analysis
+
+```{r}
+
+sd(stadium_levels)^2
+
+# Define the JAGS model with Poisson likelihood
+poisson_informative_code <- "
+model {
+  for (i in 1:N) {
+    # Poisson likelihood
+    HR[i] ~ dpois(mu[i])
+    
+    # Link function for the mean
+    log(mu[i]) <- alpha[stadium[i]]
+  }
+  
+  # Priors for alpha (stadium effects)
+  for (j in 1:K) {
+    alpha[j] ~ dnorm(0.110974, 0.01)
+  }
+}
+"
+
+# Define initial values
+inits <- function() {
+  list(
+    alpha = rnorm(K, 0, 1)
+  )
+}
+
+# Run the Gibbs sampler
+poisson_informative <- jags.model(
+  textConnection(poisson_informative_code),
+  data = poisson_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Update the model (burn-in period)
+update(poisson_informative, 1000)
+
+# Sample from the posterior
+poisson_informative_results <- coda.samples(
+  poisson_informative,
+  variable.names = c("alpha"),
+  n.iter = 5000
+)
+poisson_informative_dic <- dic.samples(poisson_informative, n.iter = 1000)
+print(poisson_informative_dic)
+
+
+# Analysis of results
+summary(poisson_informative_results)
+
+# All converged (can double check with gelman.diag() but that isn't necessary)
+plot(poisson_informative_results)
+
+# Least influential stadium #3 - Tropicana Field
+# Mean = -2.950
+# All stadiums have negative influence on HR rates!
+plot(poisson_informative_results[, "alpha[3]"])
+
+# Posterior Predictive distribution mapping for a Poisson prior
+posterior_means <- colMeans(as.matrix(poisson_informative_results))
+alpha_means <- posterior_means[1:K]
+simulated_HR <- numeric(N)
+for (i in 1:N) {
+  stadium_idx <- stadium_levels[i]
+  mu <- exp(alpha_means[stadium_idx])
+  simulated_HR[i] <- rpois(1, lambda = mu)
+}
+
+# Plot the posterior predictive check
+hist(simulated_HR, probability = TRUE, col = "blue", main = "Posterior Predictive Check")
+lines(density(HR), col = "red", lwd = 2)
+
+```
+
+
+```{r}
+
+# poisson, sample variance, 0 mean
+p_ssigma_code <- "
+model {
+  for (i in 1:N) {
+    # Poisson likelihood
+    HR[i] ~ dpois(mu[i])
+    
+    # Link function for the mean
+    log(mu[i]) <- alpha[stadium[i]]
+  }
+  
+  # Priors for alpha (stadium effects)
+  for (j in 1:K) {
+    alpha[j] ~ dnorm(0, 0.1138833)
+  }
+}
+"
+
+# Define initial values
+inits <- function() {
+  list(
+    alpha = rnorm(K, 0, 1)
+  )
+}
+
+# Run the Gibbs sampler
+p_ssigma_model <- jags.model(
+  textConnection(p_ssigma_code),
+  data = poisson_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Update the model (burn-in period)
+update(p_ssigma_model, 1000)
+
+# Sample from the posterior
+p_ssigma_results <- coda.samples(
+  p_ssigma_model,
+  variable.names = c("alpha"),
+  n.iter = 5000
+)
+p_ssigma_dic <- dic.samples(p_ssigma_model, n.iter = 1000)
+print(p_ssigma_dic)
+
+
+par(mfrow = c(1, 1))  # Single plot
+# Adjust margins
+par(mar = c(5, 4, 2, 2))
+
+plot(p_ssigma_results[,"alpha[20]"])
+
+# Posterior Predictive distribution mapping for a Poisson prior
+posterior_means <- colMeans(as.matrix(p_ssigma_results))
+alpha_means <- posterior_means[1:K]
+simulated_HR <- numeric(N)
+for (i in 1:N) {
+  stadium_idx <- stadium_levels[i]
+  mu <- exp(alpha_means[stadium_idx])
+  simulated_HR[i] <- rpois(1, lambda = mu)
+}
+
+gelman.diag(p_ssigma_results)
+
+# Plot the posterior predictive check
+hist(simulated_HR, probability = TRUE, col = "blue", main = "Posterior Predictive Check")
+lines(density(HR), col = "red", lwd = 2)
+
+
+```
+
+```{r}
+
+# poisson broad
+p_broad_code <- "
+model {
+  for (i in 1:N) {
+    # Poisson likelihood
+    HR[i] ~ dpois(mu[i])
+    
+    # Link function for the mean
+    log(mu[i]) <- alpha[stadium[i]]
+  }
+  
+  # Priors for alpha (stadium effects)
+  for (j in 1:K) {
+    alpha[j] ~ dnorm(0, 100)
+  }
+}
+"
+
+# Define initial values
+inits <- function() {
+  list(
+    alpha = rnorm(K, 0, 1)
+  )
+}
+
+# Run the Gibbs sampler
+p_broad_model <- jags.model(
+  textConnection(p_broad_code),
+  data = poisson_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Update the model (burn-in period)
+update(p_broad_model, 1000)
+
+# Calculate DIC
+p_broad_dic <- dic.samples(p_broad_model, n.iter = 1000)
+print(p_broad_dic)
+
+# Sample from the posterior
+p_broad_results <- coda.samples(
+  p_broad_model,
+  variable.names = c("alpha"),
+  n.iter = 5000
+)
+
+
+```
+
+```{r}
+
+# poisson, sample variance, sample mean
+p_smu_ssigma_code <- "
+model {
+  for (i in 1:N) {
+    # Poisson likelihood
+    HR[i] ~ dpois(mu[i])
+    
+    # Link function for the mean
+    log(mu[i]) <- alpha[stadium[i]]
+  }
+  
+  # Priors for alpha (stadium effects)
+  for (j in 1:K) {
+    alpha[j] ~ dnorm(0.110974, 0.1138833)
+  }
+}
+"
+
+# Define initial values
+inits <- function() {
+  list(
+    alpha = rnorm(K, 0, 1)
+  )
+}
+
+# Run the Gibbs sampler
+p_smu_ssigma_model <- jags.model(
+  textConnection(p_smu_ssigma_code),
+  data = poisson_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Update the model (burn-in period)
+update(p_smu_ssigma_model, 1000)
+
+# Calculate DIC
+p_smu_ssigma_dic <- dic.samples(p_smu_ssigma_model, n.iter = 1000)
+print(p_smu_ssigma_dic)
+
+# Sample from the posterior
+p_smu_ssigma_results <- coda.samples(
+  p_smu_ssigma_model,
+  variable.names = c("alpha"),
+  n.iter = 5000
+)
+
+
+```
+
+
+## Bayesian Analysis 3: HR v. Stadiums, Negative Binomial Prior
+
+Let us investigate a negative binomial prior instead.
+
+```{r}
+
+mean_HR <- mean(cleaned_data$HR)
+var_HR <- var(cleaned_data$HR)
+var_HR / mean_HR
+
+# Moderate dispersion
+nbin_gamma_code <- "
+model {
+  for (i in 1:N) {
+    # Negative binomial likelihood
+    HR[i] ~ dnegbin(p[i], r)
+    
+    # Link function for the mean
+    log(mu[i]) <- alpha[stadium[i]]
+    p[i] <- r / (r + mu[i])
+  }
+  
+  # Priors for alpha (stadium effects)
+  for (j in 1:K) {
+    alpha[j] ~ dnorm(0, 0.1138833)
+  }
+  
+  # Priors for dispersion parameter (r)
+  r ~ dgamma(5, .5)
+}
+"
+
+# Initialize data for JAGS
+nbin_data <- list(
+  N = N,
+  K = K,
+  HR = HR,
+  stadium = stadium_levels
+)
+
+# Define initial values
+inits <- function() {
+  list(
+    alpha = rnorm(K, 0, 1),
+    r = runif(1, 1, 5)
+  )
+}
+
+
+# Run the Gibbs sampler
+nbin_gamma_model <- jags.model(
+  textConnection(nbin_gamma_code),
+  data = nbin_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Update the model (burn-in period)
+update(nbin_gamma_model, 1000)
+
+# Sample from the posterior
+nbin_gamma_results <- coda.samples(
+  nbin_gamma_model,
+  variable.names = c("alpha", "r"),
+  n.iter = 1000
+)
+
+
+# Analysis of results
+summary(nbin_gamma_results)
+plot(nbin_gamma_results)
+
+# r w/ Mean = 4.862, SD = 0.76874; low overdispersion.
+plot(nbin_gamma_results[, "alpha[34]"])
+
+nbin_gamma_dic <- dic.samples(nbin_gamma_model, n.iter = 1000)
+print(nbin_gamma_dic)
+
+# Extract posterior means of alpha and r
+posterior_means <- colMeans(as.matrix(nbin_gamma_results))
+alpha_means <- posterior_means[1:K]
+r_mean <- posterior_means["r"]
+
+# Simulate HR based on the posterior predictive distribution
+simulated_HR <- numeric(N)
+for (i in 1:N) {
+  stadium_idx <- stadium_levels[i]
+  mu <- exp(alpha_means[stadium_idx])
+  p <- r_mean / (r_mean + mu)
+  simulated_HR[i] <- rnbinom(1, size = r_mean, prob = p)
+}
+
+# Plot the posterior predictive check
+# It's really close!
+hist(simulated_HR, probability = TRUE, col = "blue", main = "Posterior Predictive Check")
+lines(density(HR), col = "red", lwd = 2)
+
+```
+
+
+```{r}
+
+# Moderate dispersion
+nbin_exp_code <- "
+model {
+  for (i in 1:N) {
+    # Negative binomial likelihood
+    HR[i] ~ dnegbin(p[i], r)
+    
+    # Link function for the mean
+    log(mu[i]) <- alpha[stadium[i]]
+    p[i] <- r / (r + mu[i])
+  }
+  
+  # Priors for alpha (stadium effects)
+  for (j in 1:K) {
+    alpha[j] ~ dnorm(0, 0.1138833)
+  }
+  
+  # Priors for dispersion parameter (r)
+  r ~ dexp(0.1)
+}
+"
+
+# Initialize data for JAGS
+nbin_data <- list(
+  N = N,
+  K = K,
+  HR = HR,
+  stadium = stadium_levels
+)
+
+# Define initial values
+inits <- function() {
+  list(
+    alpha = rnorm(K, 0, 1),
+    r = runif(1, 1, 5)
+  )
+}
+
+
+# Run the Gibbs sampler
+nbin_exp_model <- jags.model(
+  textConnection(nbin_exp_code),
+  data = nbin_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Update the model (burn-in period)
+update(nbin_exp_model, 1000)
+
+unique(cleaned_data$Stadium)
+
+# Sample from the posterior
+nbin_exp_results <- coda.samples(
+  nbin_exp_model,
+  variable.names = c("alpha", "r"),
+  n.iter = 1000
+)
+
+
+# Analysis of results
+summary(nbin_exp_results)
+plot(nbin_exp_results)
+
+# r w/ Mean = 4.862, SD = 0.76874; low overdispersion.
+plot(nbin_exp_results[, "alpha[34]"])
+
+nbin_exp_dic <- dic.samples(nbin_exp_results, n.iter = 1000)
+print(nbin_exp_dic)
+
+# Extract posterior means of alpha and r
+posterior_means <- colMeans(as.matrix(nbin_gamma_results))
+alpha_means <- posterior_means[1:K]
+r_mean <- posterior_means["r"]
+
+# Simulate HR based on the posterior predictive distribution
+simulated_HR <- numeric(N)
+for (i in 1:N) {
+  stadium_idx <- stadium_levels[i]
+  mu <- exp(alpha_means[stadium_idx])
+  p <- r_mean / (r_mean + mu)
+  simulated_HR[i] <- rnbinom(1, size = r_mean, prob = p)
+}
+
+# Plot the posterior predictive check
+# It's really close!
+hist(simulated_HR, probability = TRUE, col = "blue", main = "Posterior Predictive Check")
+lines(density(HR), col = "red", lwd = 2)
+
+
+
+```
+
+## Bayesian Analysis 4: HR v. Pitcher Handedness, Poisson
+
+Time to answer our central question: what's the relationship between HR counts, the stadiums' played in, and the handedness of the pitcher. Is there a relationship between if a ball was lobbed with the right or left hand and it becoming a home run-winning hit? Because the accuracy of both the Poisson and Negative Binomial Priors are roughly equal (when assuming an uninformative hyperparameter), but the runtimes were greatly different, for ease of access we will use a poisson prior for this subsequent model. 
+
+
+```{r}
+
+plot(density(as.numeric(factor(cleaned_data$Pitch.Hand))), main="Density Plot of Pitching Hand(s)")
+
+mean(as.numeric(factor(cleaned_data$Pitch.Hand)))
+var(as.numeric(factor(cleaned_data$Pitch.Hand)))
+
+# Define the JAGS model focusing on handedness, uninformative
+uninformative_ph_code <- "
+model {
+  for (i in 1:N) {
+    # Poisson likelihood
+    HR[i] ~ dpois(mu[i])
+    
+    # Link function for the mean
+    log(mu[i]) <- beta_hand * pitch_hand[i]
+  }
+  
+  # Prior for beta_hand (effect of handedness)
+  beta_hand ~ dnorm(0, 1)
+}
+"
+
+# Initialize data for JAGS
+ph_data <- list(
+  N = N,                 
+  HR = HR,              
+  pitch_hand = pitch_hand
+)
+
+# Define initial values
+inits <- function() {
+  list(
+    beta_hand = rnorm(1, 0, 1)
+  )
+}
+
+# Run the Gibbs sampler
+uninformative_ph_model <- jags.model(
+  textConnection(uninformative_ph_code),
+  data = ph_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Update the model (burn-in period)
+update(uninformative_ph_model, 1000)
+
+# Sample from the posterior
+uninformative_ph_results <- coda.samples(
+  uninformative_ph_model,
+  variable.names = c("beta_hand"),
+  n.iter = 5000
+)
+
+uninformative_ph_dic <- dic.samples(uninformative_ph_model, n.iter = 1000)
+print(uninformative_ph_dic)
+
+
+# Analysis of results
+# beta_hand w/ Mean = -1.300451, SD = 0.0004532 (4.532e-03); Some negative effect
+summary(uninformative_ph_results)
+
+# It has converged!
+plot(uninformative_ph_results)
+
+# Extract posterior mean of beta_hand
+posterior_means <- colMeans(as.matrix(uninformative_ph_results))
+beta_hand_mean <- posterior_means["beta_hand"]
+
+# Simulate HR based on the posterior predictive distribution
+simulated_HR <- numeric(N)
+for (i in 1:N) {
+  # Calculate the mean (mu) based on beta_hand and pitch_hand
+  mu <- exp(beta_hand_mean * pitch_hand[i])
+  
+  # Simulate HR using Poisson distribution
+  simulated_HR[i] <- rpois(1, lambda = mu)
+}
+
+# Plot the posterior predictive check
+hist(simulated_HR, probability = TRUE, col = "blue", main = "Posterior Predictive Check")
+lines(density(HR), col = "red", lwd = 2)
+
+
+```
+
+
+```{r}
+
+ssigma_ph_code <- "
+model {
+  for (i in 1:N) {
+    # Poisson likelihood
+    HR[i] ~ dpois(mu[i])
+    
+    # Link function for the mean
+    log(mu[i]) <- beta_hand * pitch_hand[i]
+  }
+  
+  # Prior for beta_hand (effect of handedness)
+  beta_hand ~ dnorm(0, 0.2148009)
+}
+"
+
+# Initialize data for JAGS
+ph_data <- list(
+  N = N,                 
+  HR = HR,              
+  pitch_hand = pitch_hand
+)
+
+# Define initial values
+inits <- function() {
+  list(
+    beta_hand = rnorm(1, 0, 1)
+  )
+}
+
+# Run the Gibbs sampler
+ssigma_ph_model <- jags.model(
+  textConnection(ssigma_ph_code),
+  data = ph_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Update the model (burn-in period)
+update(ssigma_ph_model, 1000)
+
+# Sample from the posterior
+ssigma_ph_results <- coda.samples(
+  ssigma_ph_model,
+  variable.names = c("beta_hand"),
+  n.iter = 1000
+)
+
+ssigma_ph_dic <- dic.samples(ssigma_ph_model, n.iter = 1000)
+print(ssigma_ph_dic)
+
+
+# Analysis of results
+# beta_hand w/ Mean = -1.300451, SD = 0.0004532 (4.532e-03); Some negative effect
+summary(uninformative_ph_results)
+
+# It has converged!
+plot(uninformative_ph_results)
+
+# Extract posterior mean of beta_hand
+posterior_means <- colMeans(as.matrix(uninformative_ph_results))
+beta_hand_mean <- posterior_means["beta_hand"]
+
+# Simulate HR based on the posterior predictive distribution
+simulated_HR <- numeric(N)
+for (i in 1:N) {
+  # Calculate the mean (mu) based on beta_hand and pitch_hand
+  mu <- exp(beta_hand_mean * pitch_hand[i])
+  
+  # Simulate HR using Poisson distribution
+  simulated_HR[i] <- rpois(1, lambda = mu)
+}
+
+# Plot the posterior predictive check
+hist(simulated_HR, probability = TRUE, col = "blue", main = "Posterior Predictive Check")
+lines(density(HR), col = "red", lwd = 2)
+
+
+```
+
+From the above, we can see that the pitching hand does have a negative effect on HR count Recall that we denoted the Right hand with "1" and the left with "2". From the negative effect, we know that the more "influential" of the two pitching styles is the right hand as that is closer to the mean. Ergo, a right-handed pitch will negative impact a players HR count (per game).
+
+For the posterior-predictive check, we see virtually the same results as before when operating with exclusively stadium data. This establishes that both the stadium and pitching hand are equally as accurate when predicting HR counts.
+
+## Bayesian Analysis 5: HR v. Stadiums + Pitcher handedness, Negative Binomial Prior
+
+The next logical step is to complicate that last question and incorporate *both* variables. Is there a relationship between Home Runs and the stadium it was in, as well as the hand that threw it?
+
+```{r}
+
+# Define the JAGS model w/ negative binomial prior & pitching hand
+jags_model_code <- "
+model {
+  for (i in 1:N) {
+    # Negative binomial likelihood
+    HR[i] ~ dnegbin(p[i], r)
+    
+    # Link function for the mean
+    log(mu[i]) <- alpha[stadium[i]] + beta_hand * pitch_hand[i]
+    p[i] <- r / (r + mu[i])
+  }
+  
+  # Priors for alpha (stadium effects)
+  for (j in 1:K) {
+    alpha[j] ~ dnorm(0, 0.01)
+  }
+  
+  # Prior for beta_hand (effect of Pitch.Hand)
+  beta_hand ~ dnorm(0, 0.01)
+  
+  # Priors for dispersion parameter (r)
+  r ~ dgamma(1, 1)
+}
+"
+
+
+jags_data <- list(
+  N = N,
+  K = K,
+  HR = HR,
+  stadium = stadium_levels,
+  pitch_hand = pitch_hand
+)
+
+# Define initial values
+inits <- function() {
+  list(
+    alpha = rnorm(K, 0, 1),
+    beta_hand = rnorm(1, 0, 1),
+    r = runif(1, 1, 5)
+  )
+}
+
+# Run the Gibbs sampler
+jags_model <- jags.model(
+  textConnection(jags_model_code),
+  data = jags_data,
+  inits = inits,
+  n.chains = 3,
+  n.adapt = 1000
+)
+
+# Update the model (burn-in period)
+update(jags_model, 1000)
+
+# Sample from the posterior
+test_results <- coda.samples(
+  jags_model,
+  variable.names = c("alpha", "beta_hand", "r"),
+  n.iter = 5000
+)
+
+# Analysis of results
+summary(test_results)
+plot(test_results)
+
+# r w/ Mean = 4.83, SD = 0.78066; low overdispersion.
+plot(test_results[, "r"])
+
+# beta_hand w/ Mean = 0.0008151, SD = 0.01746
+# Basically no influence on HR rates when also incorporating the stadium
+# Convergence doesn't look great
+plot(test_results[, "beta_hand"])
+
+# Verify convergence with Gelman-Rubin diagnostic
+# R_hat = 1.02, Upper C.I. = 1.08
+# Erring on convergence issues, but is still within reasonable ranges
+gelman.diag(test_results)
+
+# All stadiums still have negative influence on HR rates!
+plot(test_results[, "alpha[3]"])
+
+# Extract posterior means of alpha and r
+posterior_means <- colMeans(as.matrix(test_results))
+alpha_means <- posterior_means[1:K]
+r_mean <- posterior_means["r"]
+
+# Simulate HR based on the posterior predictive distribution
+simulated_HR <- numeric(N)
+for (i in 1:N) {
+  stadium_idx <- stadium_levels[i]
+  mu <- exp(alpha_means[stadium_idx])
+  p <- r_mean / (r_mean + mu)
+  simulated_HR[i] <- rnbinom(1, size = r_mean, prob = p)
+}
+
+# Plot the posterior predictive check
+# It's not any better than before. Ergo, Handedness has no effect on Stadium performance
+hist(simulated_HR, probability = TRUE, col = "blue", main = "Posterior Predictive Check")
+lines(density(HR), col = "red", lwd = 2)
+
+```
+
+We can conclude there is no realtionship; handedness is negligible when stadiums are factored in. The stadium is a trump factor. 
